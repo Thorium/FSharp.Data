@@ -555,21 +555,23 @@ module internal HtmlParser =
             | current -> 
                 match new String(Array.append current (state.Pop(5))) with
                 | "DOCTYPE" -> docType state
-                | "[CDATA[" -> state.Cons("<![CDATA[".ToCharArray()); cData state
+                | "[CDATA[" -> state.Cons("<![CDATA[".ToCharArray()); cData 0 state
                 | _ -> bogusComment state
-        and cData (state:HtmlState) = 
-            if ((!state.Content).ToString().EndsWith("]]>"))
-            then 
-               state.InsertionMode := CDATAMode
-               state.Emit()
-            else 
-               match state.Peek() with
-               | ']' -> state.Cons();  cData state 
-               | '>' -> state.Cons();  cData state
-               | TextParser.EndOfFile _ -> 
-                    state.InsertionMode := CDATAMode
-                    state.Emit()
-               | _ -> state.Cons(); cData state
+        and cData i (state:HtmlState) =
+            match state.Peek() with
+            | ']' when i = 0 || i = 1 ->
+                state.Cons()
+                cData (i + 1) state
+            | '>' when i = 2 ->
+                state.Cons()
+                state.InsertionMode := CDATAMode
+                state.Emit()
+            | TextParser.EndOfFile _ ->
+                state.InsertionMode := CDATAMode
+                state.Emit()
+            | _ ->
+                state.Cons()
+                cData 0 state
         and docType state =
             match state.Peek() with
             | '>' -> 
@@ -702,6 +704,43 @@ module internal HtmlParser =
             | "area" | "base" | "br" | "col" | "embed"| "hr" | "img" | "input" | "keygen" | "link" | "menuitem" | "meta" | "param" 
             | "source" | "track" | "wbr" -> true
             | _ -> false
+
+        let isImplicitlyClosedByStartTag expectedTagEnd startTag  =
+            match expectedTagEnd, startTag with
+            | ("td"|"th") , ("tr"|"td"|"th") -> true        
+            | "tr", "tr" -> true
+            | "li", "li" -> true
+            | _ -> false
+        
+        let implicitlyCloseByStartTag expectedTagEnd startTag tokens =
+            match expectedTagEnd, startTag with
+            | ("td"|"th"), "tr"  -> 
+                // the new tr is closing the cell and previous row
+                TagEnd expectedTagEnd :: TagEnd "tr" :: tokens
+            | ("td"|"th") , ("td"|"th")
+            | "tr", "tr" 
+            | "li", "li" -> 
+                // tags are on same level, just close
+                TagEnd expectedTagEnd :: tokens
+            | _ -> tokens
+
+        let isImplicitlyClosedByEndTag expectedTagEnd startTag  =
+            match expectedTagEnd, startTag with
+            | ("td"|"th"|"tr") , ("thead"|"tbody"|"tfoot"|"table") -> true        
+            | "li" , "ul" -> true        
+            | _ -> false
+        
+        let implicitlyCloseByEndTag expectedTagEnd tokens =
+            match expectedTagEnd with
+            | "td" | "th" -> 
+                // the end tag closes the cell and the row
+                TagEnd expectedTagEnd :: TagEnd "tr" ::  tokens
+            | "tr"
+            | "li" -> 
+                // Only on level need to be closed
+                TagEnd expectedTagEnd :: tokens
+            | _ -> tokens
+
         let rec parse' docType elements expectedTagEnd parentTagName (tokens:HtmlToken list) =
             match tokens with
             | DocType dt :: rest -> parse' (dt.Trim()) elements expectedTagEnd parentTagName rest
@@ -714,6 +753,13 @@ module internal HtmlParser =
             | Tag(false, name, attributes) :: rest when canNotHaveChildren name ->
                let e = HtmlElement(name, attributes, [])
                parse' docType (e :: elements) expectedTagEnd parentTagName rest
+            | Tag(_, name, _) :: _ when isImplicitlyClosedByStartTag expectedTagEnd name ->
+                // insert missing </tr> </td> or </th> when starting new row/cell/header
+                parse' docType elements expectedTagEnd parentTagName (implicitlyCloseByStartTag expectedTagEnd name tokens)
+            | TagEnd(name) :: _ when isImplicitlyClosedByEndTag expectedTagEnd name ->
+                // insert missing </tr> </td> or </th> when starting new row/cell/header
+                parse' docType elements expectedTagEnd parentTagName (implicitlyCloseByEndTag expectedTagEnd tokens)
+
             | Tag(_, name, attributes) :: rest ->
                 let dt, tokens, content = parse' docType [] name expectedTagEnd rest
                 let e = HtmlElement(name, attributes, content)
